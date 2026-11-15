@@ -3,7 +3,7 @@ Event Bus implementation for Python.
 
 Supports the 5 event dispatch modes:
 - emit: Synchronous broadcast (fire-and-forget, non-blocking)
-- parallel: Asynchronous concurrent broadcast (asyncio.gather)
+- parallel: Asynchronous concurrent broadcast (asyncio.gather, failures aggregated)
 - serial: Asynchronous sequential execution with short-circuit on non-None
 - bail: Synchronous sequential execution with short-circuit on non-None
 - waterfall: Around-middleware pipeline passing `(*args, next)`
@@ -100,6 +100,10 @@ class Listener:
         self.is_async = inspect.iscoroutinefunction(callback) or inspect.isawaitable(
             callback
         )
+
+
+def _listener_name(callback: Callable[..., Any]) -> str:
+    return getattr(callback, "__qualname__", None) or repr(callback)
 
 
 async def _await_res(aw: Awaitable[Any]) -> Any:
@@ -230,11 +234,25 @@ class EventBus:
     async def parallel(
         self, event: str, *args: Any, this_arg: Any = None, **kwargs: Any
     ) -> list[Any]:
-        """All listeners run concurrently and are awaited together."""
+        """All listeners run concurrently and are awaited together.
+
+        Failures are aggregated instead of dropped. `asyncio.gather` without
+        `return_exceptions` re-raises the first exception and discards the rest,
+        so one caller with three listeners and two bugs only ever learns about
+        one of them, and cannot tell the second failed at all.
+
+        Every listener still settles first (all-settled semantics). A single
+        failure keeps propagating as itself; more than one is raised as an
+        `ExceptionGroup` naming each failing listener. `asyncio.TaskGroup` is
+        deliberately not used: it cancels the remaining listeners on the first
+        failure, which would change those semantics.
+        """
         listeners = self._filter_listeners(event, this_arg)
+        callbacks: list[Callable[..., Any]] = []
         tasks = []
         for listener in listeners:
             res = listener.callback(*args, **kwargs)
+            callbacks.append(listener.callback)
             if inspect.isawaitable(res):
                 tasks.append(res)
             else:
@@ -246,7 +264,31 @@ class EventBus:
 
         if not tasks:
             return []
-        return await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Cancellation is not a listener failure: it cannot be grouped, and
+        # swallowing it would turn "we were shut down" into "a listener broke".
+        for value in results:
+            if isinstance(value, BaseException) and not isinstance(value, Exception):
+                raise value
+        failures: list[tuple[int, Exception]] = [
+            (index, value)
+            for index, value in enumerate(results)
+            if isinstance(value, Exception)
+        ]
+        if not failures:
+            return results
+        for index, exc in failures:
+            exc.add_note(
+                f"parallel listener #{index} ({_listener_name(callbacks[index])}) "
+                f"raised for event {event!r}"
+            )
+        if len(failures) == 1:
+            raise failures[0][1]
+        raise ExceptionGroup(
+            f"parallel event {event!r}: {len(failures)} of {len(tasks)} listener(s) "
+            "failed",
+            [exc for _, exc in failures],
+        )
 
     async def serial(
         self, event: str, *args: Any, this_arg: Any = None, **kwargs: Any

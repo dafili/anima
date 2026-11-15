@@ -424,8 +424,11 @@ async def test_acceptance_dispatch_modes() -> None:
     # Parallel failure: every listener still runs to completion (the
     # oracle waits for all of them — events.ts:183-188 uses all-settled
     # semantics — and then reports the failures as one aggregate error).
-    # Anima raises the first error instead of an aggregate; pin the
-    # shared half here (all listeners settle) and the first error.
+    # Anima now aggregates too: a single failure still re-raises as itself,
+    # more than one raises an ExceptionGroup naming each listener (see
+    # tests/unit/anima/test_events.py). This case has one failure, so the
+    # pinned behaviour here is the shared half (all listeners settle) plus
+    # the original exception type.
     failing_ctx = Context()
     settled: list[str] = []
 

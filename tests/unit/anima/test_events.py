@@ -279,3 +279,81 @@ async def test_event_bus_filtering_and_global():
 
     bus.emit("msg", "hello", this_arg=ctx1)
     assert calls == ["global:hello", "no_ctx:hello", "ctx2:hello"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_reports_every_failure_not_just_the_first():
+    """Two broken listeners must both be reported, not one silently dropped.
+
+    asyncio.gather without return_exceptions re-raises the first exception and
+    discards the rest, so a caller with three listeners and two bugs only ever
+    sees one of them -- and cannot tell a second listener failed at all.
+    """
+    bus = EventBus()
+    settled = []
+
+    async def boom_one() -> None:
+        await asyncio.sleep(0.01)
+        raise RuntimeError("first failure")
+
+    async def boom_two() -> None:
+        await asyncio.sleep(0.02)
+        raise ValueError("second failure")
+
+    async def fine() -> str:
+        settled.append("fine")
+        return "fine"
+
+    bus.on("agg", boom_one)
+    bus.on("agg", boom_two)
+    bus.on("agg", fine)
+
+    with pytest.raises(ExceptionGroup) as info:
+        await bus.parallel("agg")
+
+    group = info.value
+    assert [str(exc) for exc in group.exceptions] == ["first failure", "second failure"]
+    assert "2 of 3 listener(s) failed" in str(group)
+    assert "'agg'" in str(group)
+    # all-settled semantics are unchanged: the healthy listener still ran
+    assert settled == ["fine"]
+    # each member names the listener it came from
+    notes = [note for exc in group.exceptions for note in getattr(exc, "__notes__", [])]
+    assert any("#0" in note and "boom_one" in note for note in notes), notes
+    assert any("#1" in note and "boom_two" in note for note in notes), notes
+
+
+@pytest.mark.asyncio
+async def test_parallel_single_failure_keeps_original_exception_type():
+    """One failure keeps propagating as itself; aggregation only adds detail."""
+    bus = EventBus()
+
+    async def boom() -> None:
+        raise KeyError("only one")
+
+    def ok() -> str:
+        return "ok"
+
+    bus.on("solo", boom)
+    bus.on("solo", ok)
+
+    with pytest.raises(KeyError):
+        await bus.parallel("solo")
+
+
+@pytest.mark.asyncio
+async def test_parallel_propagates_cancellation_instead_of_grouping_it():
+    """Cancellation is not a listener failure: it must not become a group member."""
+    bus = EventBus()
+
+    async def cancelled() -> None:
+        raise asyncio.CancelledError
+
+    async def ok() -> str:
+        return "ok"
+
+    bus.on("cancel", cancelled)
+    bus.on("cancel", ok)
+
+    with pytest.raises(asyncio.CancelledError):
+        await bus.parallel("cancel")
