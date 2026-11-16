@@ -8,6 +8,13 @@
   - Dynamic component and lifecycle management.
 - **Waterfall Discipline**: Waterfall event interceptors must await `next_fn(payload)` to delegate down the chain; returning without awaiting short-circuits execution.
 
+## Shared Development Guidance
+
+Follow [home AGENTS](../home/AGENTS.md) for cross-repository standards,
+[uv skill](../home/skills/uv/SKILL.md) for package management and standard
+test/type-check commands, and [Ruff skill](../home/skills/ruff/SKILL.md) for
+linting and formatting.
+
 ## Anima-Specific References
 
 ### Issue tracker
