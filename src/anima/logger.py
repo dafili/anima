@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sys
 import time
 from collections.abc import Callable
@@ -215,6 +216,13 @@ def _default_formatter_upper_c(val: Any, exp: Exporter, msg: Message) -> str:
     return str(val)
 
 
+# Terminal escape sequences are zero width: an ESC introducing a CSI
+# (``\x1b[...``), an OSC (``\x1b]...``) or a two character escape must not be
+# charged against ``max_length`` and must never be cut in half.
+_ESCAPE_SEQUENCE_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\|\Z)|\[[0-?]*[ -/]*\Z|[@-Z\\-_])"
+)
+
 DEFAULT_FORMATTERS: dict[str, Formatter] = {
     "s": _default_formatter_s,
     "d": _default_formatter_d,
@@ -225,6 +233,53 @@ DEFAULT_FORMATTERS: dict[str, Formatter] = {
     "c": _default_formatter_c,
     "C": _default_formatter_upper_c,
 }
+
+
+def _is_sgr(sequence: str) -> bool:
+    """True for ``Select Graphic Rendition`` sequences, i.e. colors/attributes."""
+    return sequence.startswith("\x1b[") and sequence.endswith("m")
+
+
+def _is_sgr_reset(sequence: str) -> bool:
+    params = sequence[2:-1]
+    return all(part in ("", "0") for part in params.split(";"))
+
+
+def _visible_length(line: str) -> int:
+    return len(_ESCAPE_SEQUENCE_RE.sub("", line))
+
+
+def _clip_to_visible_width(line: str, max_length: int) -> str:
+    """Clip ``line`` to ``max_length`` visible characters.
+
+    Escape sequences stay whole and cost nothing against the budget. If an SGR
+    attribute is still open at the cut point, a reset is appended so a clipped
+    line cannot bleed color into whatever gets printed after it.
+    """
+    if _visible_length(line) <= max_length:
+        return line
+
+    parts: list[str] = []
+    visible = 0
+    pos = 0
+    open_sgr = False
+    while pos < len(line) and visible < max_length:
+        match = _ESCAPE_SEQUENCE_RE.match(line, pos)
+        if match is not None:
+            sequence = match.group(0)
+            if _is_sgr(sequence):
+                open_sgr = not _is_sgr_reset(sequence)
+            parts.append(sequence)
+            pos = match.end()
+            continue
+        parts.append(line[pos])
+        visible += 1
+        pos += 1
+
+    clipped = "".join(parts) + "..."
+    if open_sgr:
+        clipped += "\x1b[0m"
+    return clipped
 
 
 class Logger:
@@ -258,8 +313,6 @@ class Logger:
             fmt = "%o"
             args_to_format = args
 
-        import re
-
         def _sub(m: re.Match[str]) -> str:
             token = m.group(1)
             if token == "%":
@@ -282,14 +335,9 @@ class Logger:
                     tail.append(str(arg))
             formatted = f"{formatted} {' '.join(tail)}".strip()
 
-        # Enforce max length per line
+        # Enforce max length per line, counting visible width only
         lines = formatted.split("\n")
-        clipped = []
-        for line in lines:
-            if len(line) > exporter.max_length:
-                clipped.append(line[: exporter.max_length] + "...")
-            else:
-                clipped.append(line)
+        clipped = [_clip_to_visible_width(line, exporter.max_length) for line in lines]
         return "\n".join(clipped)
 
     def _log(self, type_name: str, level: int, *args: Any) -> None:

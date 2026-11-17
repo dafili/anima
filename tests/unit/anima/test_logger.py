@@ -308,3 +308,142 @@ async def test_logger_intercept_scoped_name_and_level():
     assert len(messages) == 1
     assert messages[0].name == "scoped_agent"
     assert messages[0].args == ["scoped debug output"]
+
+
+def test_truncation_counts_visible_width_not_escape_bytes():
+    exp = Exporter(colors=True, max_length=5)
+    msg = Message(
+        sn=1,
+        ts=0.0,
+        name="n",
+        type="info",
+        level=2,
+        args=["\x1b[31mabcdef\x1b[0m"],
+    )
+    out = Logger.format(exp, msg)
+    # Five visible chars survive, the escape that opens the line is kept whole
+    assert out.startswith("\x1b[31m")
+    assert out.count("\x1b[") >= 1
+    visible = out.replace("\x1b[31m", "").replace("\x1b[0m", "")
+    assert visible == "abcde..."
+
+
+def test_truncation_never_splits_an_escape_sequence():
+    exp = Exporter(colors=True, max_length=3)
+    args = ["\x1b[38;5;196mabcdefghij\x1b[0m"]
+    out = Logger.format(
+        exp,
+        Message(sn=1, ts=0.0, name="n", type="info", level=2, args=args)
+    )
+    assert "\x1b[38;5;196m" in out
+    # Nothing but the trailing reset may follow: no half-eaten CSI at the cut
+    assert out.count("\x1b[") == 2
+    assert out.endswith("\x1b[0m")
+
+
+def test_truncation_recloses_open_sgr():
+    exp = Exporter(colors=True, max_length=4)
+    out = Logger.format(
+        exp,
+        Message(
+            sn=1,
+            ts=0.0,
+            name="n",
+            type="info",
+            level=2,
+            args=["\x1b[1;32mabcdef"],
+        )
+    )
+    assert out.endswith("...\x1b[0m")
+    visible = out.replace("\x1b[1;32m", "").replace("\x1b[0m", "")
+    assert visible == "abcd..."
+
+
+def test_truncation_leaves_already_closed_line_alone():
+    exp = Exporter(colors=True, max_length=4)
+    out = Logger.format(
+        exp,
+        Message(
+            sn=1,
+            ts=0.0,
+            name="n",
+            type="info",
+            level=2,
+            args=["\x1b[31mab\x1b[0mcdef"],
+        )
+    )
+    # 6 visible chars > 4: clipped mid run, but the opening color was closed by
+    # the caller, so no extra reset is appended after the ellipsis
+    assert out == "\x1b[31mab\x1b[0mcd..."
+
+
+def test_truncation_is_per_line_and_keeps_short_lines():
+    exp = Exporter(colors=True, max_length=5)
+    out = Logger.format(
+        exp,
+        Message(
+            sn=1,
+            ts=0.0,
+            name="n",
+            type="info",
+            level=2,
+            args=["\x1b[34mshort\x1b[0m\nabcdefgh\nok"],
+        )
+    )
+    lines = out.split("\n")
+    assert lines[0] == "\x1b[34mshort\x1b[0m"
+    assert lines[1] == "abcde..."
+    assert lines[2] == "ok"
+
+
+def test_percent_c_truncation_closes_its_own_color():
+    exp = Exporter(colors=True, max_length=6)
+    out = Logger.format(
+        exp,
+        Message(
+            sn=1,
+            ts=0.0,
+            name="tag",
+            type="info",
+            level=2,
+            args=["%C", "0123456789"],
+        )
+    )
+    assert out.startswith("\x1b[38;5;")
+    assert out.endswith("\x1b[0m")
+    visible = out
+    while "\x1b[" in visible:
+        start = visible.index("\x1b[")
+        end = visible.index("m", start) + 1
+        visible = visible[:start] + visible[end:]
+    assert visible == "012345..."
+
+
+def test_truncation_keeps_non_sgr_escapes_whole():
+    exp = Exporter(colors=True, max_length=3)
+    out = Logger.format(
+        exp,
+        Message(
+            sn=1,
+            ts=0.0,
+            name="n",
+            type="info",
+            level=2,
+            args=["\x1b[2Kabcdef"],
+        )
+    )
+    # Erase-line is not an attribute: kept verbatim, and no reset is invented
+    assert out == "\x1b[2Kabc..."
+
+
+def test_osc_hyperlink_text_counts_as_visible_width():
+    exp = Exporter(colors=True, max_length=6)
+    link = "\x1b]8;;https://example.com\x1b\\click me\x1b]8;;\x1b\\"
+    out = Logger.format(
+        exp, Message(sn=1, ts=0.0, name="n", type="info", level=2, args=[link])
+    )
+    # The OSC 8 target is not terminal content: only "click me" is visible, and
+    # swallowing the label into the escape would hide what was logged.
+    assert out.startswith("\x1b]8;;https://example.com\x1b\\")
+    assert out.endswith("click ...")
+    assert "example.com" not in out.replace("\x1b]8;;https://example.com\x1b\\", "")
