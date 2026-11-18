@@ -99,6 +99,68 @@ class TestScaffoldPrepare:
             s.prepare()
 
 
+class TestScaffoldTargetDir:
+    def test_target_dir_absolute_is_used_as_given(self, tmp_path: Path):
+        s = Scaffold({})
+        s.project = str(tmp_path / "abs")
+        assert s._target_dir() == tmp_path / "abs"
+
+    def test_target_dir_relative_joins_cwd(self, tmp_path: Path):
+        s = Scaffold({})
+        s.project = "rel"
+        with patch("anima.cli_create.Path.cwd", return_value=tmp_path):
+            assert s._target_dir() == tmp_path / "rel"
+
+
+class TestScaffoldStart:
+    @staticmethod
+    def _wire_flow(monkeypatch, scaffold: Scaffold):
+        monkeypatch.setattr(
+            scaffold, "_load_pkg", lambda: {"name": "create-anima", "version": "0.0.0"}
+        )
+        monkeypatch.setattr(scaffold, "scaffold", lambda: None)
+        monkeypatch.setattr(scaffold, "init_git", lambda: None)
+        monkeypatch.setattr(scaffold, "install", lambda: None)
+
+    def test_start_honours_absolute_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        target = tmp_path / "somewhere" / "app"
+        s = Scaffold({"name": str(target)})
+        self._wire_flow(monkeypatch, s)
+        with patch("anima.cli_create.Path.cwd", return_value=cwd):
+            s.start()
+        assert target.is_dir()
+        assert s.root_dir == str(target)
+        assert not (cwd / "app").exists()
+
+    def test_start_keeps_nested_relative_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        s = Scaffold({"name": "apps/web"})
+        self._wire_flow(monkeypatch, s)
+        with patch("anima.cli_create.Path.cwd", return_value=cwd):
+            s.start()
+        assert (cwd / "apps" / "web").is_dir()
+        assert s.root_dir == str(cwd / "apps" / "web")
+
+    def test_start_single_relative_name_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        s = Scaffold({"name": "plain"})
+        self._wire_flow(monkeypatch, s)
+        with patch("anima.cli_create.Path.cwd", return_value=cwd):
+            s.start()
+        assert (cwd / "plain").is_dir()
+        assert s.root_dir == str(cwd / "plain")
+
+
 class TestScaffoldInitGit:
     def test_init_git_skipped_when_no_git_flag(self, tmp_path: Path):
         s = Scaffold({})
