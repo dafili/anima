@@ -62,6 +62,10 @@ symbols = {
 # Anima context brand for Context.is() checks (symbol-based brand)
 _CONTEXT_BRAND = "_anima_context_brand"
 
+# Upper bound on drain passes in Fiber._unload, so a disposer that keeps
+# registering new effects cannot spin the unload forever.
+MAX_UNLOAD_PASSES = 32
+
 _current_fiber: ContextVar[Fiber | None] = ContextVar("_current_fiber", default=None)
 _access_context: ContextVar[Context | None] = ContextVar(
     "_access_context", default=None
@@ -305,18 +309,38 @@ class Fiber:
             await child.dispose()
         self.child_fibers.clear()
 
-        # Run registered effect disposers in reverse order (LIFO)
-        for disposer in reversed(list(self.effects)):
-            try:
-                res = disposer()
-                if inspect.isawaitable(res):
-                    await res
-            except Exception:
-                logger.exception(
-                    "Error during fiber %s (uid %s) effect unload", self.uid, self.name
-                )
+        # Run registered effect disposers in reverse order (LIFO). A disposer
+        # can yield to the loop, and something woken by that yield can append
+        # another effect before the unload finishes; a single snapshot plus
+        # clear() dropped those. Drain in passes until the list is empty.
+        passes = 0
+        while self.effects and passes < MAX_UNLOAD_PASSES:
+            passes += 1
+            # Clear before running, so effects registered while these disposers
+            # execute survive the pass and get drained by the next one.
+            batch = list(reversed(self.effects))
+            self.effects.clear()
+            for disposer in batch:
+                try:
+                    res = disposer()
+                    if inspect.isawaitable(res):
+                        await res
+                except Exception:
+                    logger.exception(
+                        "Error during fiber %s (uid %s) effect unload",
+                        self.uid,
+                        self.name,
+                    )
+        if self.effects:
+            logger.error(
+                "Fiber %s still had %d effect(s) after %d unload passes; "
+                "dropping them to finish the unload",
+                self.name,
+                len(self.effects),
+                MAX_UNLOAD_PASSES,
+            )
+            self.effects.clear()
 
-        self.effects.clear()
         self.store = None
         self._updateState(self._unload_complete)
 
@@ -833,8 +857,13 @@ class Fiber:
         return FiberState.PENDING
 
     def assertActive(self) -> None:
-        """Assert that the fiber is active (has a uid)."""
+        """Assert that the fiber is active (has a uid) and not unloading."""
         if self.uid is None:
+            raise AnimaError(AnimaErrorCode.INACTIVE_EFFECT)
+        if self.state in (FiberState.UNLOADING, FiberState.DISPOSED):
+            # The uid survives until dispose() clears it, so the uid check
+            # alone let anything register resources mid-unload, right before
+            # the unload drops them.
             raise AnimaError(AnimaErrorCode.INACTIVE_EFFECT)
 
     def effect(self, execute: Callable[[], Any], label: str = "anonymous") -> Any:

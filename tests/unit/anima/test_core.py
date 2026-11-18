@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from typing import Any, ClassVar
 
@@ -2033,6 +2034,70 @@ class TestFiberAssertActive:
         fib.uid = None
         with pytest.raises(AnimaError):
             fib.assertActive()
+
+    def test_effect_rejected_while_unloading(self):
+        """#14: a live uid is not enough — registering mid-unload used to pass."""
+        ctx = Context()
+        fib = ctx.use(CoreService)
+        fib.state = FiberState.UNLOADING
+        before = list(fib.effects)
+        with pytest.raises(AnimaError) as exc:
+            fib.effect(lambda: None, label="late")
+        assert exc.value.code == AnimaErrorCode.INACTIVE_EFFECT
+        assert fib.effects == before
+
+    def test_effect_rejected_when_state_disposed_with_uid(self):
+        """#14: DISPOSED is rejected even if a uid somehow survives."""
+        ctx = Context()
+        fib = ctx.use(CoreService)
+        fib.state = FiberState.DISPOSED
+        with pytest.raises(AnimaError) as exc:
+            fib.effect(lambda: None, label="late")
+        assert exc.value.code == AnimaErrorCode.INACTIVE_EFFECT
+
+
+class TestUnloadDrain:
+    """#14: a disposer registered during unwinding must still run."""
+
+    @pytest.mark.asyncio
+    async def test_effect_appended_during_unload_is_disposed(self):
+        ctx = Context()
+        fib = ctx.use(CoreService)
+        calls: list[str] = []
+
+        def late() -> None:
+            calls.append("late")
+
+        def first() -> None:
+            calls.append("first")
+            # The append that bypasses effect(); the pre-fix single snapshot
+            # plus clear() dropped it without running it.
+            fib.effects.append(late)
+
+        fib.effect(lambda: first, label="first")
+        await fib.dispose()
+        assert calls == ["first", "late"]
+        assert fib.effects == []
+
+    @pytest.mark.asyncio
+    async def test_unload_gives_up_after_max_passes(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr("anima.core.MAX_UNLOAD_PASSES", 2)
+        ctx = Context()
+        fib = ctx.use(CoreService)
+        calls: list[str] = []
+
+        def stubborn() -> None:
+            calls.append("stubborn")
+            fib.effects.append(stubborn)
+
+        fib.effect(lambda: stubborn)
+        with caplog.at_level(logging.ERROR):
+            await fib.dispose()
+        assert calls == ["stubborn", "stubborn"]
+        assert fib.effects == []
+        assert "after 2 unload passes" in caplog.text
 
 
 class TestServiceInstanceCheckEdgeCases:
