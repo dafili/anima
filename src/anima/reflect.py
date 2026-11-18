@@ -211,6 +211,20 @@ class ReflectService:
             isolate=name,
         )
         self._impl_counter += 1
+
+        def disposer() -> None:
+            if self.store.get(name) is impl:
+                del self.store[name]
+            self.notify([name])
+
+        # The disposer and the owning fiber are wired up before the impl is
+        # visible: a listener notified between the store write and the effect
+        # registration could observe a service it cannot dispose.
+        fiber = _current_fiber.get() or self.ctx._fiber
+        impl.fiber = fiber
+        if fiber is not None:  # pragma: no cover
+            fiber.effects.append(disposer)
+
         self.store[name] = impl
 
         # Notify dependents only once the providing fiber is ACTIVE: a
@@ -219,20 +233,8 @@ class ReflectService:
         # Notifying during load would emit the service event twice — once
         # here, once at activation. With no owning fiber known, notify as
         # before; there is no loading fiber to defer to.
-        fiber = _current_fiber.get() or self.ctx._fiber
         if fiber is None or fiber.state == FiberState.ACTIVE:
             self.notify([name])
-
-        def disposer() -> None:
-            if self.store.get(name) is impl:
-                del self.store[name]
-            self.notify([name])
-
-        # Register disposer as effect on the current fiber (anima parity:
-        # this.ctx.fiber.effect(...) registers the disposer on the fiber)
-        impl.fiber = fiber
-        if fiber is not None:  # pragma: no cover
-            fiber.effects.append(disposer)
 
         return disposer
 

@@ -506,6 +506,35 @@ class TestReflectServiceProvideInactive:
         assert child_rs.get("my_svc", strict=False) is None
 
 
+class TestReflectServiceProvideOrdering:
+    def test_disposer_registered_before_notify(self):
+        """provide wires the disposer before any listener can see the service."""
+        ctx = Context()
+        def handler(c):
+            pass
+
+        provider = ctx.use(handler)
+        child = Context(parent=ctx, fiber=provider)
+        child_rs = ReflectService(child)
+        seen = {}
+
+        def spy(names):
+            impl = child_rs._get_impl("svc", strict=False)
+            if impl is not None and "impl_fiber" not in seen:
+                seen["effects"] = list(provider.effects)
+                seen["impl_fiber"] = impl.fiber
+            return []
+
+        child_rs.notify = spy  # type: ignore[method-assign]
+        child_rs.provide("svc", "value")
+
+        assert seen["impl_fiber"] is provider
+        assert len(seen["effects"]) == 1
+        # the disposer a listener could already reach really disposes the impl
+        seen["effects"][0]()
+        assert "svc" not in child_rs.store
+
+
 class TestReflectServiceDisposerAlreadyRemoved:
     def test_disposer_already_removed(self):
         """disposer when impl was already removed from store."""
