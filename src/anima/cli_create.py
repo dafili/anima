@@ -78,7 +78,7 @@ class Scaffold:
 
     def prepare(self) -> None:
         """Create the target directory, removing it first if forced."""
-        root_dir = Path.cwd() / self.project
+        root_dir = self._target_dir()
         if not root_dir.exists():
             root_dir.mkdir(parents=True, exist_ok=True)
             self.root_dir = str(root_dir)
@@ -192,14 +192,21 @@ class Scaffold:
         print(f"  create {pkg['name']}  v{pkg['version']}")
         print()
         name = self.get_name(prompt)
-        self.project = Path(name).name
-        self.root_dir = str(Path.cwd() / self.project)
+        self.project = str(Path(name))
+        self.root_dir = str(self._target_dir())
         self.prepare()
         self.scaffold()
         self.init_git()
         self.install()
 
     # -- internal helpers -----------------------------------------------------
+
+    def _target_dir(self) -> Path:
+        """Resolve the project target, honouring absolute paths as given."""
+        target = Path(self.project)
+        if target.is_absolute():
+            return target
+        return Path.cwd() / target
 
     def _stat(self, path: Path) -> Any:
         try:
