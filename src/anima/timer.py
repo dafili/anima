@@ -202,7 +202,9 @@ class TimerService(Service):
             if is_disposed:
                 return None
 
-            now = time.time()
+            # Monotonic clock: a wall-clock jump (NTP step, suspend/resume)
+            # must not stretch or collapse the throttle window.
+            now = time.monotonic()
             remaining = d - (now - last_call)
 
             if remaining <= 0:
@@ -227,7 +229,7 @@ class TimerService(Service):
                 async def _delayed_trailing() -> None:
                     nonlocal last_call
                     await asyncio.sleep(remaining)
-                    last_call = time.time()
+                    last_call = time.monotonic()
                     res = callback(*args, **kwargs)
                     if inspect.isawaitable(res):
                         await res

@@ -235,3 +235,23 @@ async def test_throttle_rate_limiting_and_trailing():
 
     t_uncalled = timer.throttle(lambda: None, 0.05)
     t_uncalled.dispose()
+
+
+@pytest.mark.asyncio
+async def test_throttle_window_survives_wall_clock_jump(monkeypatch):
+    ctx = Context()
+    timer = TimerService(ctx)
+    ctx.provide("timer", timer)
+
+    calls = []
+    wall = [1_700_000_000.0]
+    monkeypatch.setattr("anima.timer.time.time", lambda: wall[0])
+
+    throttled = timer.throttle(lambda x: calls.append(x), 30.0, no_trailing=True)
+    throttled("first")
+    assert calls == ["first"]
+
+    # NTP-style step forward: a wall-clock window would look long expired
+    wall[0] += 3600.0
+    throttled("second")
+    assert calls == ["first"]
