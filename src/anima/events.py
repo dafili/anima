@@ -100,6 +100,9 @@ class Listener:
         self.is_async = inspect.iscoroutinefunction(callback) or inspect.isawaitable(
             callback
         )
+        # Dispatch snapshots listener references, so removal has to be visible
+        # through the listener itself, not only through the registry list.
+        self.removed = False
 
 
 async def _await_res(aw: Awaitable[Any]) -> Any:
@@ -119,8 +122,11 @@ async def _dispatch_one(
 
     Invoking the callback inside a coroutine (rather than in the dispatch loop)
     keeps a listener that raises synchronously from aborting the dispatch before
-    its siblings are even started.
+    its siblings are even started. A listener disposed by a sibling during
+    dispatch is skipped at invocation time.
     """
+    if listener.removed:
+        return None
     result = listener.callback(*args, **kwargs)
     if inspect.isawaitable(result):
         return await result
@@ -171,9 +177,11 @@ class EventBus:
             self._listeners[event].append(listener)
 
         def dispose() -> None:
-            if event in self._listeners and listener in self._listeners[event]:
-                self._listeners[event].remove(listener)
-                if not self._listeners[event]:
+            listener.removed = True
+            bucket = self._listeners.get(event)
+            if bucket is not None and listener in bucket:
+                bucket.remove(listener)
+                if not bucket:
                     del self._listeners[event]
 
         return dispose
@@ -192,17 +200,24 @@ class EventBus:
         disposed = False
         inner_disposer: Disposer | None = None
 
-        def dispose_self() -> None:
+        def _consume() -> bool:
+            """Claim the single invocation. False once it has been claimed."""
             nonlocal disposed
-            if not disposed:
-                disposed = True
-                assert inner_disposer is not None
-                inner_disposer()
+            if disposed:
+                return False
+            disposed = True
+            assert inner_disposer is not None
+            inner_disposer()
+            return True
+
+        def dispose_self() -> None:
+            _consume()
 
         if inspect.iscoroutinefunction(callback):
 
             async def _async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                dispose_self()
+                if not _consume():
+                    return None
                 return await callback(*args, **kwargs)
 
             inner_disposer = self.on(
@@ -216,7 +231,8 @@ class EventBus:
         else:
 
             def _sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                dispose_self()
+                if not _consume():
+                    return None
                 return callback(*args, **kwargs)
 
             inner_disposer = self.on(
@@ -234,6 +250,8 @@ class EventBus:
         """Synchronous broadcast. Listeners observe in registration order without awaiting."""
         listeners = self._filter_listeners(event, this_arg)
         for listener in listeners:
+            if listener.removed:
+                continue
             try:
                 res = listener.callback(*args, **kwargs)
                 if inspect.isawaitable(res):
@@ -267,7 +285,11 @@ class EventBus:
                 ``CancelledError``), which is always re-raised as-is.
             ExceptionGroup: When two or more listeners failed with exceptions.
         """
-        listeners = self._filter_listeners(event, this_arg)
+        listeners = [
+            listener
+            for listener in self._filter_listeners(event, this_arg)
+            if not listener.removed
+        ]
         if not listeners:
             return []
         results = await asyncio.gather(
@@ -308,6 +330,8 @@ class EventBus:
         """Serial - listeners run in order, awaited. First bailed value wins."""
         listeners = self._filter_listeners(event, this_arg)
         for listener in listeners:
+            if listener.removed:
+                continue
             res = listener.callback(*args, **kwargs)
             if inspect.isawaitable(res):
                 res = await res
@@ -319,6 +343,8 @@ class EventBus:
         """Bail - synchronous serial. First bailed value wins."""
         listeners = self._filter_listeners(event, this_arg)
         for listener in listeners:
+            if listener.removed:
+                continue
             res = listener.callback(*args, **kwargs)
             if inspect.isawaitable(res):
                 # Cannot block safely in synchronous bail if awaitable returned
@@ -355,6 +381,9 @@ class EventBus:
                 return current_args[0] if current_args else None
 
             current_listener = listeners[index]
+
+            if current_listener.removed:
+                return await dispatch(index + 1, *current_args, **current_kwargs)
 
             async def next_fn(*next_args: Any, **next_kwargs: Any) -> Any:
                 call_args = next_args if next_args else current_args
