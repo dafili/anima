@@ -486,3 +486,43 @@ def test_empty_duck_typed_exception_group_still_logs_itself():
     svc.error(MockEmptyGroup("bundle with no children"))
     assert len(logs) == 1
     assert "bundle with no children" in str(logs[0].args[0])
+
+
+def test_self_caused_exception_logs_once_instead_of_recursing():
+    """A ``__cause__`` that points at itself must not blow the stack."""
+    svc = LoggerService(Context())
+    logs = []
+
+    class CapturingExporter(Exporter):
+        def export(self, message: Message):
+            logs.append(message)
+
+    svc.exporter(CapturingExporter())
+
+    err = ValueError("cycle victim")
+    err.__cause__ = err
+    svc.error(err)
+
+    assert len(logs) == 1
+    assert "cycle victim" in str(logs[0].args[0])
+
+
+def test_two_node_cause_cycle_logs_the_node_that_closes_it():
+    """A -> B -> A cannot be walked forever; one message, no RecursionError."""
+    svc = LoggerService(Context())
+    logs = []
+
+    class CapturingExporter(Exporter):
+        def export(self, message: Message):
+            logs.append(message)
+
+    svc.exporter(CapturingExporter())
+
+    first = ValueError("first")
+    second = RuntimeError("second")
+    first.__cause__ = second
+    second.__cause__ = first
+    svc.error(first)
+
+    assert len(logs) == 1
+    assert isinstance(logs[0].args[0], BaseException)
