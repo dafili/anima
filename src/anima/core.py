@@ -190,6 +190,15 @@ class Fiber:
         self.child_fibers: list[Fiber] = []
         self.effects: list[Disposer] = []
         self._is_root = root
+        # update() is serialised per fiber: two concurrent calls otherwise
+        # interleave their waterfalls, and one restart tears the epoch down
+        # while the other is still resolving against it (assertActive fails
+        # with INACTIVE_EFFECT on a perfectly valid update). The lock is
+        # created on first use so a fiber built outside a running loop still
+        # works; _update_owner keeps a listener that calls back into
+        # update() from deadlocking on its own lock.
+        self._update_lock: asyncio.Lock | None = None
+        self._update_owner: asyncio.Task[Any] | None = None
         self.uid: int | None
         self.state: FiberState
         self._runner_epoch: str
@@ -643,8 +652,30 @@ class Fiber:
         keeps its old config). On a non-ACTIVE fiber resolution is
         deferred: the error is cleared and the epoch machine drives a
         fresh activation, which validates then.
+
+        Calls are serialised: a concurrent update waits for the in-flight
+        one to finish its restart instead of racing it. A listener that
+        updates the same fiber from inside an update keeps the lock it
+        already holds rather than deadlocking.
         """
         self.assertActive()
+        if self._update_owner is asyncio.current_task():
+            await self._update_locked(config, no_save)
+            return
+        if self._update_lock is None:
+            self._update_lock = asyncio.Lock()
+        async with self._update_lock:
+            self._update_owner = asyncio.current_task()
+            try:
+                # Re-check once the slot is ours: the fiber may have been
+                # disposed while this call was queued behind another update.
+                self.assertActive()
+                await self._update_locked(config, no_save)
+            finally:
+                self._update_owner = None
+
+    async def _update_locked(self, config: Any, no_save: bool) -> None:
+        """Body of update(), run with the fiber's update slot held."""
         self.raw_config = dict(config) if isinstance(config, dict) else config
 
         if self.state != FiberState.ACTIVE:

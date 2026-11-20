@@ -2798,3 +2798,92 @@ class TestDependentDisposalAwaited:
         ctx = Context()
         ctx.provide("lonely", object())
         assert ctx._unregister_service("lonely") is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_updates_serialise_instead_of_racing():
+    """Two update() calls run one after the other; neither trips INACTIVE_EFFECT."""
+    ctx = Context()
+    events: list[tuple[str, int]] = []
+
+    def component(c: Context, config: Any = None):
+        return None
+
+    component.name = "serial_update"
+    fiber = ctx.use(component, val=1)
+    await ctx.flush()
+
+    async def slow(cfg: Any, next_fn: Any):
+        events.append(("enter", cfg["val"]))
+        await asyncio.sleep(0.01)
+        events.append(("exit", cfg["val"]))
+        await next_fn(cfg)
+
+    ctx.on("internal/update", slow, mode=EventMode.WATERFALL)
+
+    await asyncio.gather(fiber.update({"val": 2}), fiber.update({"val": 3}))
+
+    # A serialised run nests the pairs; an overlapping one interleaves them.
+    assert events == [("enter", 2), ("exit", 2), ("enter", 3), ("exit", 3)]
+    assert fiber.config == {"val": 3}
+
+
+@pytest.mark.asyncio
+async def test_update_queued_behind_another_raises_once_disposed():
+    """A queued update wakes up after dispose() and refuses to run."""
+    ctx = Context()
+    gate = asyncio.Event()
+
+    def component(c: Context, config: Any = None):
+        return None
+
+    component.name = "queued_update"
+    fiber = ctx.use(component, val=1)
+    await ctx.flush()
+
+    async def hold(cfg: Any, next_fn: Any):
+        if cfg["val"] == 2:
+            await gate.wait()
+        await next_fn(cfg)
+
+    ctx.on("internal/update", hold, mode=EventMode.WATERFALL)
+
+    first = asyncio.ensure_future(fiber.update({"val": 2}))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    queued = asyncio.ensure_future(fiber.update({"val": 4}))
+    await asyncio.sleep(0)
+    disposal = asyncio.ensure_future(fiber.dispose())
+    await asyncio.sleep(0)
+    gate.set()
+    results = await asyncio.gather(first, queued, disposal, return_exceptions=True)
+
+    assert isinstance(results[1], AnimaError)
+    assert fiber.state == FiberState.DISPOSED
+
+
+@pytest.mark.asyncio
+async def test_update_from_inside_a_listener_reuses_the_held_slot():
+    """A listener updating its own fiber does not deadlock on the update lock."""
+    ctx = Context()
+    reentered: list[bool] = []
+
+    def component(c: Context, config: Any = None):
+        return None
+
+    component.name = "reentrant_update"
+    fiber = ctx.use(component, val=1)
+    await ctx.flush()
+
+    async def listener(cfg: Any, next_fn: Any):
+        if cfg["val"] == 2 and not reentered:
+            reentered.append(True)
+            await fiber.update({"val": 3})
+        await next_fn(cfg)
+
+    ctx.on("internal/update", listener, mode=EventMode.WATERFALL)
+
+    await asyncio.wait_for(fiber.update({"val": 2}), timeout=5)
+
+    assert reentered == [True]
+    assert fiber.config == {"val": 3}
