@@ -486,3 +486,61 @@ def test_empty_duck_typed_exception_group_still_logs_itself():
     svc.error(MockEmptyGroup("bundle with no children"))
     assert len(logs) == 1
     assert "bundle with no children" in str(logs[0].args[0])
+
+
+def test_exporter_error_only_level_is_honoured():
+    """ERROR is 0, so a 0 threshold must not be read as "unset"."""
+    svc = LoggerService(Context())
+    seen = []
+
+    class CapturingExporter(Exporter):
+        def export(self, message: Message):
+            seen.append(message.type)
+
+    svc.exporter(CapturingExporter(levels={"default": LoggerLevel.ERROR}))
+    log = svc("root")
+    log.warning("dropped")
+    log.info("dropped")
+    log.error("kept")
+
+    assert seen == ["error"]
+
+
+def test_exporter_per_name_error_level_is_honoured():
+    """A per-name ERROR threshold resolves before the exporter default."""
+    svc = LoggerService(Context())
+    seen = []
+
+    class CapturingExporter(Exporter):
+        def export(self, message: Message):
+            seen.append(message.name)
+
+    svc.exporter(
+        CapturingExporter(
+            levels={"strict": LoggerLevel.ERROR, "default": LoggerLevel.DEBUG}
+        )
+    )
+    strict = svc("strict")
+    strict.warning("dropped")
+    strict.error("kept")
+    svc("other").debug("kept by the DEBUG default")
+
+    assert seen == ["strict", "other"]
+
+
+def test_logger_handle_error_level_is_honoured():
+    """An explicit ERROR level on the handle outranks the service default."""
+    svc = LoggerService(Context())
+    seen = []
+
+    class CapturingExporter(Exporter):
+        def export(self, message: Message):
+            seen.append(message.type)
+
+    svc.exporter(CapturingExporter())
+    strict = Logger("strict", svc, level=LoggerLevel.ERROR)
+    strict.warning("dropped")
+    strict.info("dropped")
+    strict.error("kept")
+
+    assert seen == ["error"]
