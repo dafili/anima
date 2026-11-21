@@ -2887,3 +2887,98 @@ async def test_update_from_inside_a_listener_reuses_the_held_slot():
 
     assert reentered == [True]
     assert fiber.config == {"val": 3}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spawn", ["create_task", "gather", "ensure_future"])
+async def test_update_from_a_task_spawned_inside_a_listener_does_not_deadlock(
+    spawn: str,
+):
+    """Reentry across a task boundary is still the same fiber's update slot.
+
+    A listener that spawns a task and awaits update() on the same fiber used
+    to block forever on the lock its own ancestor was holding, because the
+    owner was tracked as a Task. The context a child task copies carries the
+    in-flight marker, so the nested call joins the running update instead.
+    """
+    ctx = Context()
+
+    def component(c: Context, config: Any = None):
+        return None
+
+    component.name = "cross_task_update"
+    fiber = ctx.use(component, val=1)
+    await ctx.flush()
+
+    inner_done: list[int] = []
+
+    async def listener(cfg: Any, next_fn: Any):
+        if cfg["val"] != 2:
+            await next_fn(cfg)
+            return
+
+        async def nested() -> None:
+            await fiber.update({"val": 3})
+            inner_done.append(cfg["val"])
+
+        if spawn == "create_task":
+            await asyncio.create_task(nested())
+        elif spawn == "gather":
+            await asyncio.gather(nested())
+        else:
+            await asyncio.ensure_future(nested())
+        await next_fn(cfg)
+
+    ctx.on("internal/update", listener, mode=EventMode.WATERFALL)
+
+    await asyncio.wait_for(fiber.update({"val": 2}), timeout=5)
+
+    assert inner_done == [2]
+    assert fiber.config == {"val": 3}
+    assert fiber.state == FiberState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_update_from_a_background_task_started_by_a_listener_never_hangs():
+    """The loader shape: a listener schedules a drain task that updates the
+    same fiber, and nobody awaits it from inside the listener.
+
+    ``Include._schedule_apply`` starts ``_apply_loop`` from wherever it runs,
+    and that loop awaits ``root.update(tree)``. When the schedule happens
+    inside an update, the drain is a child task of the updating task, so it
+    must not queue behind the lock its own parent holds. It may still lose the
+    race against the surrounding restart and fail with INACTIVE_EFFECT — what
+    it must not do is block forever on the slot.
+    """
+    ctx = Context()
+    scheduled: list[asyncio.Task[None]] = []
+    outcome: list[str] = []
+
+    def component(c: Context, config: Any = None):
+        return None
+
+    component.name = "background_apply"
+    fiber = ctx.use(component, val=1)
+    await ctx.flush()
+
+    async def listener(cfg: Any, next_fn: Any):
+        if cfg["val"] == 2:
+
+            async def drain() -> None:
+                try:
+                    await fiber.update({"val": 7})
+                except AnimaError:
+                    outcome.append("inactive")
+                else:
+                    outcome.append("applied")
+
+            scheduled.append(asyncio.get_running_loop().create_task(drain()))
+        await next_fn(cfg)
+
+    ctx.on("internal/update", listener, mode=EventMode.WATERFALL)
+
+    await asyncio.wait_for(fiber.update({"val": 2}), timeout=5)
+    assert scheduled, "listener did not schedule its drain task"
+    await asyncio.wait_for(asyncio.gather(*scheduled), timeout=5)
+
+    assert outcome in (["applied"], ["inactive"]), outcome
