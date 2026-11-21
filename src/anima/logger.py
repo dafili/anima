@@ -383,12 +383,17 @@ class Logger:
 
         # Export to exporters
         for exporter in list(self.service.exporters.values()):
-            target_level = (
-                exporter.levels.get(self.name)
-                or exporter.levels.get("default")
-                or self.level
-                or self.service.default_level
-            )
+            # Resolve the threshold with explicit ``None`` checks: ERROR is 0,
+            # so an ``or`` chain treats the strictest level anyone can ask for
+            # as "unset" and falls through to INFO, exporting exactly the
+            # messages that level was meant to drop.
+            target_level = exporter.levels.get(self.name)
+            if target_level is None:
+                target_level = exporter.levels.get("default")
+            if target_level is None:
+                target_level = self.level
+            if target_level is None:
+                target_level = self.service.default_level
             if level <= target_level:
                 try:
                     exporter.export(msg)
